@@ -1,8 +1,8 @@
 import os
 from io import BytesIO
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -123,21 +123,80 @@ def classify_row(row: Any) -> Dict[str, Any]:
     confidence = round(100 * scores[category], 1)
     return {"category": category, "confidence": confidence}
 
+# ---------- Helpers to read uploads without requiring python-multipart at import ----------
+async def _read_uploaded_files(request: Request) -> Tuple[List[Tuple[str, bytes]], List[str]]:
+    """Return list of (name, content) from either multipart/form-data, JSON base64, or raw body.
+    Never imports python-multipart at module import time."""
+    errors: List[str] = []
+    ct = request.headers.get("content-type", "")
+
+    # 1) multipart/form-data (preferred)
+    if ct.startswith("multipart/form-data"):
+        try:
+            form = await request.form()
+        except Exception as e:
+            errors.append(f"Cannot parse multipart form: {str(e)[:120]}")
+            return [], errors
+        files = []
+        # Expect field name 'files'
+        for item in form.getlist("files"):
+            try:
+                name = getattr(item, "filename", "uploaded")
+                content = await item.read()
+                files.append((name or "uploaded", content))
+            except Exception as e:
+                errors.append(f"Failed reading part: {str(e)[:120]}")
+        if files:
+            return files, errors
+        errors.append("No 'files' field found in form data")
+        return [], errors
+
+    # 2) JSON: { files: [{name, content_base64}] }
+    if "application/json" in ct:
+        try:
+            payload = await request.json()
+            files_payload = payload.get("files") if isinstance(payload, dict) else None
+            out: List[Tuple[str, bytes]] = []
+            if isinstance(files_payload, list):
+                import base64
+                for f in files_payload:
+                    name = f.get("name") or "uploaded"
+                    b64 = f.get("content_base64") or ""
+                    try:
+                        out.append((name, base64.b64decode(b64)))
+                    except Exception:
+                        errors.append(f"Invalid base64 for {name}")
+                if out:
+                    return out, errors
+        except Exception as e:
+            errors.append(f"Invalid JSON payload: {str(e)[:120]}")
+            return [], errors
+
+    # 3) Raw body (single file). Expect header X-Filename
+    try:
+        body = await request.body()
+        if body:
+            name = request.headers.get("x-filename", "uploaded")
+            return [(name, body)], errors
+    except Exception as e:
+        errors.append(f"Unable to read request body: {str(e)[:120]}")
+
+    return [], errors
 
 # ---------- Processing Endpoint ----------
 @app.post("/api/process")
-async def process_files(files: List[UploadFile] = File(...)):
+async def process_files(request: Request):
     pd = get_pd()
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    files_read, errors = await _read_uploaded_files(request)
+    if not files_read:
+        raise HTTPException(status_code=400, detail=("No files uploaded or unsupported content-type. "
+                                                    "Send multipart/form-data with field 'files' or JSON with base64."))
 
     frames: List[Any] = []
-    errors: List[str] = []
 
-    for f in files:
-        name = f.filename or "uploaded"
+    for name, content in files_read:
         try:
-            content = await f.read()
             if name.lower().endswith((".xlsx", ".xls")):
                 try:
                     df = pd.read_excel(BytesIO(content), engine="openpyxl")
@@ -147,8 +206,11 @@ async def process_files(files: List[UploadFile] = File(...)):
             elif name.lower().endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
             else:
-                errors.append(f"Unsupported file type: {name}")
-                continue
+                # Try best-effort: attempt excel then csv
+                try:
+                    df = pd.read_excel(BytesIO(content))
+                except Exception:
+                    df = pd.read_csv(BytesIO(content))
             if df.empty:
                 errors.append(f"No rows in {name}")
                 continue
